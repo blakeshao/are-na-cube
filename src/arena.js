@@ -132,6 +132,91 @@ export async function pickRandomBlock() {
   throw new Error('could not find a random block');
 }
 
+// Build a game scenario: pick a starting block, walk `hops` flips through the
+// block graph (each step is the immediate next/prev block within a channel's
+// listing — what counts as one cube rotation in-game), then use one of the
+// final block's channels as the destination. The walked path is itself a
+// valid `hops`-flip solution.
+//
+// The key constraint vs. picking a random block per channel: each hop is an
+// *adjacent* item in the channel listing, because that's what a single cube
+// flip actually moves you to. Random-block hops can be 50+ flips apart inside
+// a long channel.
+//
+// Returns `{startBlock, destChannel, destBlockIds}` (a Set of image-block IDs
+// in the destination channel) or null if a walk can't be completed.
+export async function pickGameSetup(hops = 3) {
+  // Pick a starting block with channel connections.
+  let startBlock = null;
+  for (let i = 0; i < 8 && !startBlock; i++) {
+    try {
+      const pick = await pickRandomChannelWithImageBlocks();
+      if (!pick) continue;
+      const stub = pick.blocks[Math.floor(Math.random() * pick.blocks.length)];
+      const full = await fetchBlock(stub.id);
+      if (getConnections(full).length) startBlock = full;
+    } catch (e) { /* retry */ }
+  }
+  if (!startBlock) return null;
+
+  const visited = new Set([startBlock.id]);
+  let current = startBlock;
+  for (let hop = 0; hop < hops; hop++) {
+    const conns = shuffled(getConnections(current).filter(channelLooksSafe));
+    let next = null;
+    for (const ch of conns) {
+      if (next) break;
+      try {
+        const contents = await fetchChannelContents(ch.slug, 1, 100);
+        if (contents['nsfw?']) continue;
+        const list = (contents.contents || []).filter(b => b.class === 'Image' && b.image);
+        if (list.length < 2) continue;
+        // `current` must be on this page for us to know who its neighbors in
+        // the listing actually are. If a channel has > 100 blocks and current
+        // lives past page 1 we can't determine a 1-flip neighbor, so skip.
+        const idx = list.findIndex(b => b.id === current.id);
+        if (idx === -1) continue;
+        // Try the immediate forward and backward neighbors (random order).
+        const dirs = Math.random() < 0.5 ? [1, -1] : [-1, 1];
+        for (const dir of dirs) {
+          const cand = list[(idx + dir + list.length) % list.length];
+          if (!cand || visited.has(cand.id)) continue;
+          try {
+            const full = await fetchBlock(cand.id);
+            if (!getConnections(full).length) continue;
+            next = full;
+            break;
+          } catch (e) { /* try the other direction */ }
+        }
+      } catch (e) { /* try next channel */ }
+    }
+    if (!next) return null;
+    visited.add(next.id);
+    current = next;
+  }
+
+  // Use one of the final block's channels as the destination. The walked
+  // path's final block is in that channel, so the path resolves the game —
+  // but only if that block also appears on the channel's first page (which
+  // is what destBlockIds covers), otherwise the win check never fires.
+  const destCandidates = shuffled(getConnections(current).filter(channelLooksSafe));
+  for (const ch of destCandidates) {
+    try {
+      const contents = await fetchChannelContents(ch.slug, 1, 100);
+      if (contents['nsfw?']) continue;
+      const blocks = (contents.contents || []).filter(b => b.class === 'Image' && b.image);
+      if (!blocks.length) continue;
+      const destBlockIds = new Set(blocks.map(b => b.id));
+      if (!destBlockIds.has(current.id)) continue;
+      // Skip channels that already include the start block — that would be a
+      // 0-flip win.
+      if (destBlockIds.has(startBlock.id)) continue;
+      return { startBlock, destChannel: ch, destBlockIds };
+    } catch (e) { /* try another */ }
+  }
+  return null;
+}
+
 // Pick a random image-rich, safe channel. Returns `{channel, contents, blocks}`
 // where `blocks` is the filtered list of image blocks on the chosen page.
 // Returns null when nothing usable is found in a single attempt — callers loop.
@@ -156,6 +241,13 @@ export async function pickRandomChannelWithImageBlocks() {
 
 export function blockImageUrl(block) {
   if (!block || !block.image) return null;
+  // For animated formats, prefer the `original` URL — are.na's resized
+  // variants are flattened to static images, so using `large` would lose
+  // the animation.
+  const ct = block.image.content_type;
+  if (ct === 'image/gif' || ct === 'image/webp' || ct === 'image/apng') {
+    return block.image.original?.url || block.image.large?.url || block.image.display?.url;
+  }
   return block.image.large?.url || block.image.display?.url || block.image.original?.url;
 }
 

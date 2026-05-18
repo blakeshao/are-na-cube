@@ -28,9 +28,33 @@
     <div id="game-panel" hidden>
       <div id="game-goal-label" class="dim">flip your way to</div>
       <div id="game-goal-channel"></div>
+      <div id="game-distance" class="dim"></div>
       <div id="game-status">
         <span id="game-steps">0 flips</span>
+        <button id="game-debug-win" type="button">debug win</button>
         <button id="game-exit" type="button">give up</button>
+      </div>
+    </div>
+
+    <div id="game-result" hidden>
+      <div id="game-result-card">
+        <div id="game-result-title">you made it :)</div>
+        <div id="game-result-sub" class="dim">arrived in</div>
+        <div id="game-result-channel"></div>
+        <div id="game-result-stats">
+          <div class="stat">
+            <div class="stat-value" id="stat-flips">0</div>
+            <div class="stat-label">flips</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="stat-blocks">0</div>
+            <div class="stat-label">blocks seen</div>
+          </div>
+        </div>
+        <div id="game-result-actions">
+          <button id="game-result-again" type="button">play again</button>
+          <button id="game-result-close" type="button">close</button>
+        </div>
       </div>
     </div>
 
@@ -78,6 +102,10 @@
     </div>
 
     <canvas id="stage"></canvas>
+
+    <div id="game-loading" hidden>
+      <div id="game-loading-text">setting up the game…</div>
+    </div>
 
     <script type="module" src="/src/main.js"></script>
   </body>

@@ -7,6 +7,7 @@ import {
   getConnections,
   pickSafeChannelWithContents,
   pickRandomChannelWithImageBlocks,
+  pickGameSetup,
 } from './arena.js';
 import { paintFace } from './rendering.js';
 import { createScene, FACES, HALF_PI } from './cube3d.js';
@@ -59,6 +60,7 @@ function populateNeighbors() {
   for (const f of ['right', 'left', 'top', 'bottom', 'back']) {
     paint(f, cubeState.faces[f]);
   }
+  if (gameState.active) renderGamePanel();
 }
 
 async function seed(block) {
@@ -66,6 +68,7 @@ async function seed(block) {
   console.log(`[seed] start block=${block.id}`);
   cubeState.current = block;
   cubeState.loadingCurrent = false;
+  if (gameState.active && block?.id) gameState.visitedBlocks.add(block.id);
   checkWin();
   cubeState.channelH = null;
   cubeState.channelV = null;
@@ -130,6 +133,7 @@ const gameState = {
   destBlockIds: new Set(),
   steps: 0,
   won: false,
+  visitedBlocks: new Set(),
 };
 
 function checkWin() {
@@ -138,6 +142,7 @@ function checkWin() {
   if (id && gameState.destBlockIds.has(id)) {
     gameState.won = true;
     renderGamePanel();
+    showGameResult();
   }
 }
 
@@ -210,6 +215,7 @@ async function onLanded(rx, ry) {
       }
       cubeState.current = full;
       cubeState.loadingCurrent = false;
+      if (gameState.active && full?.id) gameState.visitedBlocks.add(full.id);
       updateMeta();
       checkWin();
       const connections = getConnections(full);
@@ -489,25 +495,76 @@ const gamePanel = document.getElementById('game-panel');
 const gameGoalChannel = document.getElementById('game-goal-channel');
 const gameStatus = document.getElementById('game-status');
 const gameStepsEl = document.getElementById('game-steps');
+const gameDistanceEl = document.getElementById('game-distance');
 const gameExitBtn = document.getElementById('game-exit');
+
+// Heuristic distance from the current block to a block in destChannel, using
+// only locally-loaded data (no extra API calls). Counts how far through the
+// current H/V channels you'd have to scroll to hit a destination block, and
+// falls back to checking just the visible cube neighbors. Returns null when
+// nothing reachable is in view — we render that as "many".
+function computeFlipsAway() {
+  if (!gameState.active) return null;
+  const cur = cubeState.current;
+  if (!cur) return null;
+  const dest = gameState.destBlockIds;
+  if (!dest || !dest.size) return null;
+  if (dest.has(cur.id)) return 0;
+
+  let best = Infinity;
+  for (const f of ['top', 'bottom', 'left', 'right']) {
+    const n = cubeState.faces[f];
+    if (n && dest.has(n.id)) best = Math.min(best, 1);
+  }
+  const scanChannel = (blocks, idx) => {
+    const n = blocks.length;
+    if (n < 2) return;
+    const max = Math.floor(n / 2);
+    for (let k = 1; k <= max && k < best; k++) {
+      if (dest.has(blocks[(idx + k) % n].id) || dest.has(blocks[((idx - k) % n + n) % n].id)) {
+        best = k;
+        return;
+      }
+    }
+  };
+  scanChannel(cubeState.blocksH, cubeState.idxH);
+  scanChannel(cubeState.blocksV, cubeState.idxV);
+  return Number.isFinite(best) ? best : null;
+}
 
 function renderGamePanel() {
   if (!gameState.active) {
     gamePanel.hidden = true;
-    gameStatus.classList.remove('won');
     return;
   }
   gamePanel.hidden = false;
   gameGoalChannel.textContent = gameState.destChannel?.title || '—';
-  if (gameState.won) {
-    gameStatus.classList.add('won');
-    gameStepsEl.textContent = `you arrived in ${gameState.steps} ${gameState.steps === 1 ? 'flip' : 'flips'}!`;
-    gameExitBtn.textContent = 'done';
+  gameStepsEl.textContent = `${gameState.steps} ${gameState.steps === 1 ? 'flip' : 'flips'}`;
+  gameExitBtn.textContent = gameState.won ? 'done' : 'give up';
+  const d = computeFlipsAway();
+  if (d == null) {
+    gameDistanceEl.innerHTML = `<span class="game-distance-num">many</span> flips away`;
   } else {
-    gameStatus.classList.remove('won');
-    gameStepsEl.textContent = `${gameState.steps} ${gameState.steps === 1 ? 'flip' : 'flips'}`;
-    gameExitBtn.textContent = 'give up';
+    gameDistanceEl.innerHTML = `<span class="game-distance-num">${d}</span> ${d === 1 ? 'flip' : 'flips'} away`;
   }
+}
+
+const gameResult = document.getElementById('game-result');
+const gameResultChannel = document.getElementById('game-result-channel');
+const statFlips = document.getElementById('stat-flips');
+const statBlocks = document.getElementById('stat-blocks');
+const gameResultAgain = document.getElementById('game-result-again');
+const gameResultClose = document.getElementById('game-result-close');
+
+function showGameResult() {
+  gameResultChannel.textContent = gameState.destChannel?.title || '—';
+  statFlips.textContent = String(gameState.steps);
+  statBlocks.textContent = String(gameState.visitedBlocks.size);
+  gameResult.hidden = false;
+}
+
+function hideGameResult() {
+  gameResult.hidden = true;
 }
 
 function setEntryDisabled(disabled) {
@@ -517,44 +574,34 @@ function setEntryDisabled(disabled) {
   playBtn.disabled = disabled;
 }
 
-async function pickDestinationAndStart() {
-  // Pick destination channel: must have image blocks and be safe.
-  let dest = null;
-  for (let i = 0; i < 8 && !dest; i++) {
-    try { dest = await pickRandomChannelWithImageBlocks(); } catch (e) { /* retry */ }
-  }
-  if (!dest) throw new Error('could not pick a destination channel');
-  const destIds = new Set(dest.blocks.map(b => b.id));
-
-  // Pick starting block from a different channel and not already in destination.
-  for (let i = 0; i < 8; i++) {
+const TARGET_HOPS = 5;
+async function buildGameScenario() {
+  // Walk TARGET_HOPS channel-hops away from a random starting block to derive
+  // a destination channel that is reachable from the start in that many flips.
+  for (let i = 0; i < 5; i++) {
     try {
-      const startPick = await pickRandomChannelWithImageBlocks();
-      if (!startPick) continue;
-      if (startPick.channel.slug === dest.channel.slug) continue;
-      const candidates = startPick.blocks.filter(b => !destIds.has(b.id));
-      if (!candidates.length) continue;
-      const stub = candidates[Math.floor(Math.random() * candidates.length)];
-      const block = await fetchBlock(stub.id);
-      // Need connections so the cube has navigable axes.
-      if (!getConnections(block).length) continue;
-      return { dest, destIds, startBlock: block };
+      const setup = await pickGameSetup(TARGET_HOPS);
+      if (setup) return setup;
     } catch (e) { /* retry */ }
   }
-  throw new Error('could not find a starting block');
+  throw new Error('could not build a game');
 }
 
+const gameLoading = document.getElementById('game-loading');
 async function startGame() {
   if (gameState.active) return;
   setEntryDisabled(true);
+  gameLoading.hidden = false;
   document.getElementById('meta-title').textContent = 'setting up the game…';
   try {
-    const { dest, destIds, startBlock } = await pickDestinationAndStart();
+    const { startBlock, destChannel, destBlockIds } = await buildGameScenario();
     gameState.active = true;
-    gameState.destChannel = dest.channel;
-    gameState.destBlockIds = destIds;
+    gameState.destChannel = destChannel;
+    gameState.destBlockIds = destBlockIds;
     gameState.steps = 0;
     gameState.won = false;
+    gameState.visitedBlocks = new Set();
+    hideGameResult();
     renderGamePanel();
     // Re-enable only the exit button; entry stays disabled while playing.
     playBtn.disabled = true;
@@ -564,6 +611,8 @@ async function startGame() {
     setEntryDisabled(false);
     gameState.active = false;
     renderGamePanel();
+  } finally {
+    gameLoading.hidden = true;
   }
 }
 
@@ -573,11 +622,27 @@ function exitGame() {
   gameState.destBlockIds = new Set();
   gameState.steps = 0;
   gameState.won = false;
+  gameState.visitedBlocks = new Set();
   renderGamePanel();
+  hideGameResult();
   setEntryDisabled(false);
 }
 
 playBtn.addEventListener('click', startGame);
 gameExitBtn.addEventListener('click', exitGame);
+
+const gameDebugWinBtn = document.getElementById('game-debug-win');
+gameDebugWinBtn.addEventListener('click', () => {
+  if (!gameState.active || gameState.won) return;
+  gameState.won = true;
+  renderGamePanel();
+  showGameResult();
+});
+gameResultClose.addEventListener('click', exitGame);
+gameResultAgain.addEventListener('click', () => {
+  hideGameResult();
+  exitGame();
+  startGame();
+});
 
 startRandom();
