@@ -6,6 +6,7 @@ import {
   fetchChannelContents,
   getConnections,
   pickSafeChannelWithContents,
+  pickRandomChannelWithImageBlocks,
 } from './arena.js';
 import { paintFace } from './rendering.js';
 import { createScene, FACES, HALF_PI } from './cube3d.js';
@@ -61,8 +62,11 @@ function populateNeighbors() {
 }
 
 async function seed(block) {
+  const tSeed = performance.now();
+  console.log(`[seed] start block=${block.id}`);
   cubeState.current = block;
   cubeState.loadingCurrent = false;
+  checkWin();
   cubeState.channelH = null;
   cubeState.channelV = null;
   cubeState.loadingH = true;
@@ -79,6 +83,7 @@ async function seed(block) {
 
   try {
     const connections = getConnections(block);
+    console.log(`[seed] ${connections.length} connections`);
     if (!connections.length) return;
     const hPick = await pickSafeChannelWithContents(connections);
     if (!hPick) return;
@@ -95,6 +100,7 @@ async function seed(block) {
     cubeState.loadingH = false;
     cubeState.loadingV = false;
     updateMeta();
+    console.log(`[seed] done in ${Math.round(performance.now() - tSeed)}ms — loadingCurrent=${cubeState.loadingCurrent} loadingH=${cubeState.loadingH} loadingV=${cubeState.loadingV}`);
   }
 }
 
@@ -117,11 +123,35 @@ function applyPermutation(key) {
   for (const f of FACES) paint(f, next[f]);
 }
 
+// ---------- game mode ----------
+const gameState = {
+  active: false,
+  destChannel: null,
+  destBlockIds: new Set(),
+  steps: 0,
+  won: false,
+};
+
+function checkWin() {
+  if (!gameState.active || gameState.won) return;
+  const id = cubeState.current?.id;
+  if (id && gameState.destBlockIds.has(id)) {
+    gameState.won = true;
+    renderGamePanel();
+  }
+}
+
 let promoting = false;
 let wheelLocked = false;
 async function onLanded(rx, ry) {
   if (promoting) return;
   if (rx === 0 && ry === 0) return;
+  const tLand = performance.now();
+  console.log(`[onLanded] start rx=${rx} ry=${ry}`);
+  if (gameState.active && !gameState.won) {
+    gameState.steps += Math.abs(rx) + Math.abs(ry);
+    renderGamePanel();
+  }
   promoting = true;
   try {
     if (ry !== 0) {
@@ -170,13 +200,20 @@ async function onLanded(rx, ry) {
       // Refetch the full block so we have its channel list.
       let full = newCurrent;
       if (!full.connections || full.connections.length === 0) {
+        console.log(`[onLanded] stub has no connections, refetching block ${newCurrent.id}`);
+        const tFb = performance.now();
         try { full = await fetchBlock(newCurrent.id); }
-        catch (e) { /* keep stub */ }
+        catch (e) { console.log(`[onLanded] fetchBlock failed: ${e.message}`); }
+        console.log(`[onLanded] block refetch took ${Math.round(performance.now() - tFb)}ms`);
+      } else {
+        console.log(`[onLanded] stub already has ${full.connections.length} connections, no refetch needed`);
       }
       cubeState.current = full;
       cubeState.loadingCurrent = false;
       updateMeta();
+      checkWin();
       const connections = getConnections(full);
+      console.log(`[onLanded] ${connections.length} safe connections — keepH=${keepH} keepV=${keepV}`);
       if (!connections.length) return;
 
       if (keepH && keepV) {
@@ -212,6 +249,7 @@ async function onLanded(rx, ry) {
   } finally {
     promoting = false;
     wheelLocked = false;
+    console.log(`[onLanded] done in ${Math.round(performance.now() - tLand)}ms — current=${cubeState.current?.id} loadingCurrent=${cubeState.loadingCurrent} loadingH=${cubeState.loadingH} loadingV=${cubeState.loadingV}`);
   }
 }
 
@@ -230,20 +268,25 @@ function loadingBlurSpan(len) {
 }
 
 const FADE_MS = 180;
-const fadeTimers = new WeakMap();
+// Track the pending target per element so rapid-fire fadeSet calls compare
+// against what's *about to be written*, not what's currently in the DOM.
+// Without this, if call A schedules "write blur" and call B wants the same
+// value the DOM already shows, B no-ops without cancelling A — and A's blur
+// lands ~180ms later with no further updateMeta to clear it.
+const fadePending = new WeakMap();
 function fadeSet(el, newValue, asHtml = false) {
-  const current = asHtml ? el.innerHTML : el.textContent;
+  const pending = fadePending.get(el);
+  const current = pending ? pending.value : (asHtml ? el.innerHTML : el.textContent);
   if (current === newValue) return;
-  const prev = fadeTimers.get(el);
-  if (prev) clearTimeout(prev);
+  if (pending) clearTimeout(pending.timer);
   el.style.opacity = '0';
-  const t = setTimeout(() => {
+  const timer = setTimeout(() => {
     if (asHtml) el.innerHTML = newValue;
     else el.textContent = newValue;
     el.style.opacity = '1';
-    fadeTimers.delete(el);
+    fadePending.delete(el);
   }, FADE_MS);
-  fadeTimers.set(el, t);
+  fadePending.set(el, { timer, value: newValue });
 }
 
 function formatDate(s) {
@@ -254,6 +297,7 @@ function formatDate(s) {
 }
 
 function updateMeta() {
+  console.log(`[updateMeta] current=${cubeState.current?.id ?? 'null'} loadingCurrent=${cubeState.loadingCurrent} channelH=${cubeState.channelH?.slug ?? 'null'}/loadingH=${cubeState.loadingH} channelV=${cubeState.channelV?.slug ?? 'null'}/loadingV=${cubeState.loadingV}`);
   const t = document.getElementById('meta-title');
   const author = document.getElementById('meta-author');
   const created = document.getElementById('meta-created');
@@ -426,12 +470,114 @@ async function startRandom() {
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
+  if (gameState.active) return;
   const id = parseBlockInput(input.value);
   if (id) { startWithBlockId(id); return; }
   const slug = parseChannelInput(input.value);
   if (slug) { startWithChannelSlug(slug); return; }
   document.getElementById('meta-title').textContent = 'paste an are.na block or channel URL';
 });
-randomBtn.addEventListener('click', startRandom);
+randomBtn.addEventListener('click', () => {
+  if (gameState.active) return;
+  startRandom();
+});
+
+// ---------- game mode UI ----------
+const playBtn = document.getElementById('entry-play');
+const goBtn = document.getElementById('entry-go');
+const gamePanel = document.getElementById('game-panel');
+const gameGoalChannel = document.getElementById('game-goal-channel');
+const gameStatus = document.getElementById('game-status');
+const gameStepsEl = document.getElementById('game-steps');
+const gameExitBtn = document.getElementById('game-exit');
+
+function renderGamePanel() {
+  if (!gameState.active) {
+    gamePanel.hidden = true;
+    gameStatus.classList.remove('won');
+    return;
+  }
+  gamePanel.hidden = false;
+  gameGoalChannel.textContent = gameState.destChannel?.title || '—';
+  if (gameState.won) {
+    gameStatus.classList.add('won');
+    gameStepsEl.textContent = `you arrived in ${gameState.steps} ${gameState.steps === 1 ? 'flip' : 'flips'}!`;
+    gameExitBtn.textContent = 'done';
+  } else {
+    gameStatus.classList.remove('won');
+    gameStepsEl.textContent = `${gameState.steps} ${gameState.steps === 1 ? 'flip' : 'flips'}`;
+    gameExitBtn.textContent = 'give up';
+  }
+}
+
+function setEntryDisabled(disabled) {
+  input.disabled = disabled;
+  goBtn.disabled = disabled;
+  randomBtn.disabled = disabled;
+  playBtn.disabled = disabled;
+}
+
+async function pickDestinationAndStart() {
+  // Pick destination channel: must have image blocks and be safe.
+  let dest = null;
+  for (let i = 0; i < 8 && !dest; i++) {
+    try { dest = await pickRandomChannelWithImageBlocks(); } catch (e) { /* retry */ }
+  }
+  if (!dest) throw new Error('could not pick a destination channel');
+  const destIds = new Set(dest.blocks.map(b => b.id));
+
+  // Pick starting block from a different channel and not already in destination.
+  for (let i = 0; i < 8; i++) {
+    try {
+      const startPick = await pickRandomChannelWithImageBlocks();
+      if (!startPick) continue;
+      if (startPick.channel.slug === dest.channel.slug) continue;
+      const candidates = startPick.blocks.filter(b => !destIds.has(b.id));
+      if (!candidates.length) continue;
+      const stub = candidates[Math.floor(Math.random() * candidates.length)];
+      const block = await fetchBlock(stub.id);
+      // Need connections so the cube has navigable axes.
+      if (!getConnections(block).length) continue;
+      return { dest, destIds, startBlock: block };
+    } catch (e) { /* retry */ }
+  }
+  throw new Error('could not find a starting block');
+}
+
+async function startGame() {
+  if (gameState.active) return;
+  setEntryDisabled(true);
+  document.getElementById('meta-title').textContent = 'setting up the game…';
+  try {
+    const { dest, destIds, startBlock } = await pickDestinationAndStart();
+    gameState.active = true;
+    gameState.destChannel = dest.channel;
+    gameState.destBlockIds = destIds;
+    gameState.steps = 0;
+    gameState.won = false;
+    renderGamePanel();
+    // Re-enable only the exit button; entry stays disabled while playing.
+    playBtn.disabled = true;
+    await seed(startBlock);
+  } catch (e) {
+    document.getElementById('meta-title').textContent = `game setup failed: ${e.message}`;
+    setEntryDisabled(false);
+    gameState.active = false;
+    renderGamePanel();
+  }
+}
+
+function exitGame() {
+  gameState.active = false;
+  gameState.destChannel = null;
+  gameState.destBlockIds = new Set();
+  gameState.steps = 0;
+  gameState.won = false;
+  renderGamePanel();
+  setEntryDisabled(false);
+}
+
+playBtn.addEventListener('click', startGame);
+gameExitBtn.addEventListener('click', exitGame);
 
 startRandom();

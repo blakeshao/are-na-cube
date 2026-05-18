@@ -20,11 +20,18 @@ async function arenaFetch(url, { retries = 3 } = {}) {
 
 const blockCache = new Map();
 export async function fetchBlock(id) {
-  if (blockCache.has(id)) return blockCache.get(id);
+  if (blockCache.has(id)) {
+    console.log(`[arena] block cache hit: ${id}`);
+    return blockCache.get(id);
+  }
+  console.log(`[arena] fetching block: ${id}`);
+  const t0 = performance.now();
   const p = (async () => {
     const r = await arenaFetch(`${ARENA}/blocks/${id}`);
     if (!r.ok) throw new Error(`block ${id}: ${r.status}`);
-    return r.json();
+    const j = await r.json();
+    console.log(`[arena] fetched block: ${id} — ${(j.connections || []).length} connections in ${Math.round(performance.now() - t0)}ms`);
+    return j;
   })();
   blockCache.set(id, p);
   try { return await p; } catch (e) { blockCache.delete(id); throw e; }
@@ -33,11 +40,18 @@ export async function fetchBlock(id) {
 const channelContentsCache = new Map();
 export async function fetchChannelContents(slug, page = 1, per = 100) {
   const key = `${slug}|${page}|${per}`;
-  if (channelContentsCache.has(key)) return channelContentsCache.get(key);
+  if (channelContentsCache.has(key)) {
+    console.log(`[arena] channel cache hit: ${slug} (p${page}/${per})`);
+    return channelContentsCache.get(key);
+  }
+  console.log(`[arena] fetching channel: ${slug} (p${page}/${per})`);
+  const t0 = performance.now();
   const p = (async () => {
     const r = await arenaFetch(`${ARENA}/channels/${encodeURIComponent(slug)}/contents?page=${page}&per=${per}&direction=desc`);
     if (!r.ok) throw new Error(`channel ${slug}: ${r.status}`);
-    return r.json();
+    const j = await r.json();
+    console.log(`[arena] fetched channel: ${slug} — ${(j.contents || []).length} items in ${Math.round(performance.now() - t0)}ms`);
+    return j;
   })();
   channelContentsCache.set(key, p);
   try { return await p; } catch (e) { channelContentsCache.delete(key); throw e; }
@@ -107,27 +121,37 @@ const SEED_TERMS = [
 export async function pickRandomBlock() {
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
-      const term = SEED_TERMS[Math.floor(Math.random() * SEED_TERMS.length)];
-      const r = await arenaFetch(`${ARENA}/search/channels?q=${encodeURIComponent(term)}&per=30`);
-      if (!r.ok) continue;
-      const j = await r.json();
-      const candidates = (j.channels || []).filter(c =>
-        c.length >= 10 && c.status !== 'private' && channelLooksSafe(c)
-      );
-      if (!candidates.length) continue;
-      const channel = candidates[Math.floor(Math.random() * candidates.length)];
-      const maxPage = Math.max(1, Math.ceil(channel.length / 50));
-      const page = 1 + Math.floor(Math.random() * Math.min(maxPage, 5));
-      const contents = await fetchChannelContents(channel.slug, page, 50);
-      const blocks = (contents.contents || []).filter(b => b.class === 'Image' && b.image);
-      if (!blocks.length) continue;
-      const stub = blocks[Math.floor(Math.random() * blocks.length)];
+      const pick = await pickRandomChannelWithImageBlocks();
+      if (!pick) continue;
+      const stub = pick.blocks[Math.floor(Math.random() * pick.blocks.length)];
       return await fetchBlock(stub.id);
     } catch (e) {
       // try again
     }
   }
   throw new Error('could not find a random block');
+}
+
+// Pick a random image-rich, safe channel. Returns `{channel, contents, blocks}`
+// where `blocks` is the filtered list of image blocks on the chosen page.
+// Returns null when nothing usable is found in a single attempt — callers loop.
+export async function pickRandomChannelWithImageBlocks() {
+  const term = SEED_TERMS[Math.floor(Math.random() * SEED_TERMS.length)];
+  const r = await arenaFetch(`${ARENA}/search/channels?q=${encodeURIComponent(term)}&per=30`);
+  if (!r.ok) return null;
+  const j = await r.json();
+  const candidates = (j.channels || []).filter(c =>
+    c.length >= 10 && c.status !== 'private' && channelLooksSafe(c)
+  );
+  if (!candidates.length) return null;
+  const channel = candidates[Math.floor(Math.random() * candidates.length)];
+  const maxPage = Math.max(1, Math.ceil(channel.length / 50));
+  const page = 1 + Math.floor(Math.random() * Math.min(maxPage, 5));
+  const contents = await fetchChannelContents(channel.slug, page, 50);
+  if (contents['nsfw?']) return null;
+  const blocks = (contents.contents || []).filter(b => b.class === 'Image' && b.image);
+  if (!blocks.length) return null;
+  return { channel, contents, blocks };
 }
 
 export function blockImageUrl(block) {
@@ -151,15 +175,19 @@ export async function pickSafeChannelWithContents(connections, excludeSlugs = []
   const cached = shuffled(safe.filter(c => hasCachedContents(c.slug)));
   const cold = shuffled(safe.filter(c => !hasCachedContents(c.slug)));
   const ordered = [...cached, ...cold];
+  console.log(`[arena] pickSafeChannel: ${safe.length} safe of ${connections.length} (${cached.length} cached, ${cold.length} cold) — trying ${ordered.map(c => c.slug).join(', ')}`);
+  const tStart = performance.now();
   for (const channel of ordered) {
     try {
       const contents = await fetchChannelContents(channel.slug, 1, 100);
-      if (contents['nsfw?']) continue;
+      if (contents['nsfw?']) { console.log(`[arena] skip nsfw: ${channel.slug}`); continue; }
+      console.log(`[arena] pickSafeChannel: picked ${channel.slug} in ${Math.round(performance.now() - tStart)}ms`);
       return { channel, contents };
     } catch (e) {
-      // try another
+      console.log(`[arena] pickSafeChannel: ${channel.slug} failed — ${e.message}`);
     }
   }
+  console.log(`[arena] pickSafeChannel: nothing usable after ${Math.round(performance.now() - tStart)}ms`);
   return null;
 }
 

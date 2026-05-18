@@ -50,12 +50,25 @@ const imageCache = new Map();
 // (the common case after navigation, since neighbors prefetch eagerly).
 const imageReady = new Map();
 function loadImage(url) {
-  if (imageCache.has(url)) return imageCache.get(url);
+  if (imageCache.has(url)) {
+    const ready = imageReady.has(url);
+    console.log(`[img] cache ${ready ? 'hit (ready)' : 'hit (pending)'}: ${url.slice(0, 80)}`);
+    return imageCache.get(url);
+  }
+  console.log(`[img] fetching: ${url.slice(0, 80)}`);
+  const t0 = performance.now();
   const p = new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => { imageReady.set(url, img); resolve(img); };
-    img.onerror = () => reject(new Error('img load'));
+    img.onload = () => {
+      imageReady.set(url, img);
+      console.log(`[img] loaded in ${Math.round(performance.now() - t0)}ms: ${url.slice(0, 80)}`);
+      resolve(img);
+    };
+    img.onerror = () => {
+      console.log(`[img] failed after ${Math.round(performance.now() - t0)}ms: ${url.slice(0, 80)}`);
+      reject(new Error('img load'));
+    };
     img.src = url;
   });
   imageCache.set(url, p);
@@ -85,6 +98,7 @@ export async function paintFace(faceTextures, faceName, block) {
     ft.texture.needsUpdate = true;
     return;
   }
+  console.log(`[paint] face=${faceName} block=${block.id} — showing placeholder, image not ready`);
   drawPlaceholder(ft.ctx, block.title || block.class || '');
   ft.texture.needsUpdate = true;
   if (!url) return;
