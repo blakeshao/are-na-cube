@@ -435,7 +435,7 @@ window.addEventListener('wheel', (e) => {
   const ay = Math.abs(e.deltaY);
   if (ax < WHEEL_THRESHOLD && ay < WHEEL_THRESHOLD) return;
   if (ay >= ax) {
-    state.targetX = Math.sign(e.deltaY) * HALF_PI;
+    state.targetX = -Math.sign(e.deltaY) * HALF_PI;
   } else {
     state.targetY = Math.sign(e.deltaX) * HALF_PI;
   }
@@ -448,8 +448,8 @@ window.addEventListener('keydown', (e) => {
   if (tags.includes(document.activeElement?.tagName)) return;
   if (e.key === 'ArrowRight') state.targetY -= HALF_PI;
   else if (e.key === 'ArrowLeft') state.targetY += HALF_PI;
-  else if (e.key === 'ArrowDown') state.targetX += HALF_PI;
-  else if (e.key === 'ArrowUp') state.targetX -= HALF_PI;
+  else if (e.key === 'ArrowDown') state.targetX -= HALF_PI;
+  else if (e.key === 'ArrowUp') state.targetX += HALF_PI;
   else return;
   state.lastInputAt = performance.now();
 });
@@ -477,7 +477,7 @@ canvas.addEventListener('pointermove', (e) => {
     state.targetY = clamp(totalDx * DRAG_SENSITIVITY, -HALF_PI, HALF_PI);
     state.targetX = 0;
   } else {
-    state.targetX = clamp(-totalDy * DRAG_SENSITIVITY, -HALF_PI, HALF_PI);
+    state.targetX = clamp(totalDy * DRAG_SENSITIVITY, -HALF_PI, HALF_PI);
     state.targetY = 0;
   }
   state.lastInputAt = performance.now();
