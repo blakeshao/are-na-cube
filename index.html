@@ -26,13 +26,25 @@
     </form>
 
     <div id="game-panel" hidden>
-      <div id="game-goal-label" class="dim">flip your way to</div>
-      <div id="game-goal-channel"></div>
-      <div id="game-distance" class="dim"></div>
-      <div id="game-status">
-        <span id="game-steps">0 flips</span>
-        <button id="game-debug-win" type="button">debug win</button>
-        <button id="game-exit" type="button">give up</button>
+      <div class="cube-anim-scene cube-anim-scene--panel">
+        <div class="cube-anim">
+          <div class="cube-anim-face cube-anim-face--front"></div>
+          <div class="cube-anim-face cube-anim-face--back"></div>
+          <div class="cube-anim-face cube-anim-face--right"></div>
+          <div class="cube-anim-face cube-anim-face--left"></div>
+          <div class="cube-anim-face cube-anim-face--top"></div>
+          <div class="cube-anim-face cube-anim-face--bottom"></div>
+        </div>
+      </div>
+      <div id="game-panel-body">
+        <div id="game-goal-label" class="dim">flip your way to</div>
+        <div id="game-goal-channel"></div>
+        <div id="game-distance" class="dim"></div>
+        <div id="game-status">
+          <span id="game-steps">0 flips</span>
+          <button id="game-debug-win" type="button">debug win</button>
+          <button id="game-exit" type="button">give up</button>
+        </div>
       </div>
     </div>
 
@@ -104,6 +116,16 @@
     <canvas id="stage"></canvas>
 
     <div id="game-loading" hidden>
+      <div class="cube-anim-scene">
+        <div class="cube-anim">
+          <div class="cube-anim-face cube-anim-face--front"></div>
+          <div class="cube-anim-face cube-anim-face--back"></div>
+          <div class="cube-anim-face cube-anim-face--right"></div>
+          <div class="cube-anim-face cube-anim-face--left"></div>
+          <div class="cube-anim-face cube-anim-face--top"></div>
+          <div class="cube-anim-face cube-anim-face--bottom"></div>
+        </div>
+      </div>
       <div id="game-loading-text">setting up the game…</div>
     </div>
 

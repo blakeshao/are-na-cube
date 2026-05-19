@@ -88,11 +88,12 @@ async function seed(block) {
     const connections = getConnections(block);
     console.log(`[seed] ${connections.length} connections`);
     if (!connections.length) return;
-    const hPick = await pickSafeChannelWithContents(connections);
+    const opts = { deterministic: gameState.active };
+    const hPick = await pickSafeChannelWithContents(connections, [], opts);
     if (!hPick) return;
     cubeState.channelH = hPick.channel;
     cubeState.loadingH = false;
-    const vPick = await pickSafeChannelWithContents(connections, [hPick.channel.slug]) || hPick;
+    const vPick = await pickSafeChannelWithContents(connections, [hPick.channel.slug], opts) || hPick;
     cubeState.channelV = vPick.channel;
     cubeState.loadingV = false;
 
@@ -103,6 +104,7 @@ async function seed(block) {
     cubeState.loadingH = false;
     cubeState.loadingV = false;
     updateMeta();
+    if (gameState.active) snapshotCurrentBlock();
     console.log(`[seed] done in ${Math.round(performance.now() - tSeed)}ms — loadingCurrent=${cubeState.loadingCurrent} loadingH=${cubeState.loadingH} loadingV=${cubeState.loadingV}`);
   }
 }
@@ -131,10 +133,52 @@ const gameState = {
   active: false,
   destChannel: null,
   destBlockIds: new Set(),
+  // The constructed solution path (array of block IDs from start → destination).
+  // When the user is sitting on one of these blocks, distance is exact:
+  // `path.length - 1 - index`. Off-path positions fall back to the scan
+  // heuristic, which is best-effort.
+  path: [],
   steps: 0,
   won: false,
   visitedBlocks: new Set(),
 };
+
+// Game-mode only: cache each visited block's full cube state (channels,
+// listings, indexes). When the user flips back to a block they've been on
+// before we restore from cache instead of re-fetching the block and
+// re-rolling its perpendicular axis — that re-roll is what previously made
+// "going back" land you somewhere unfamiliar.
+const gameBlockCache = new Map();
+
+function snapshotCurrentBlock() {
+  const id = cubeState.current?.id;
+  if (!gameState.active || !id) return;
+  gameBlockCache.set(id, {
+    block: cubeState.current,
+    channelH: cubeState.channelH,
+    channelV: cubeState.channelV,
+    blocksH: cubeState.blocksH,
+    blocksV: cubeState.blocksV,
+    idxH: cubeState.idxH,
+    idxV: cubeState.idxV,
+  });
+}
+
+function restoreBlockSnapshot(id) {
+  const s = gameBlockCache.get(id);
+  if (!s) return false;
+  cubeState.current = s.block;
+  cubeState.channelH = s.channelH;
+  cubeState.channelV = s.channelV;
+  cubeState.blocksH = s.blocksH;
+  cubeState.blocksV = s.blocksV;
+  cubeState.idxH = s.idxH;
+  cubeState.idxV = s.idxV;
+  cubeState.loadingCurrent = false;
+  cubeState.loadingH = false;
+  cubeState.loadingV = false;
+  return true;
+}
 
 function checkWin() {
   if (!gameState.active || gameState.won) return;
@@ -158,6 +202,8 @@ async function onLanded(rx, ry) {
     renderGamePanel();
   }
   promoting = true;
+  // Snapshot the block we're about to leave so a return flip can restore it.
+  if (gameState.active) snapshotCurrentBlock();
   try {
     if (ry !== 0) {
       const key = ry < 0 ? 'y-1' : 'y+1';
@@ -182,6 +228,18 @@ async function onLanded(rx, ry) {
 
     const newCurrent = cubeState.faces.front;
     if (!newCurrent || (cubeState.current && newCurrent.id === cubeState.current.id)) return;
+
+    // Game mode: if we've been on this block before, restore its full cached
+    // state — no refetch, no perpendicular re-pick. The user sees the same
+    // channels/neighbors they saw last time they were here.
+    if (gameState.active && gameBlockCache.has(newCurrent.id)) {
+      restoreBlockSnapshot(newCurrent.id);
+      populateNeighbors();
+      updateMeta();
+      checkWin();
+      console.log(`[onLanded] restored cached state for block ${newCurrent.id}`);
+      return;
+    }
 
     // Keep the channel along the axis we just traveled through; only re-pick
     // the perpendicular one. The new block lives in the traveled channel
@@ -229,7 +287,7 @@ async function onLanded(rx, ry) {
 
       const keptSlug = keepH ? cubeState.channelH?.slug : cubeState.channelV?.slug;
       const pool = connections.filter(c => c.slug !== keptSlug);
-      const pick = await pickSafeChannelWithContents(pool.length ? pool : connections);
+      const pick = await pickSafeChannelWithContents(pool.length ? pool : connections, [], { deterministic: gameState.active });
       if (!pick) {
         populateNeighbors();
         return;
@@ -498,11 +556,18 @@ const gameStepsEl = document.getElementById('game-steps');
 const gameDistanceEl = document.getElementById('game-distance');
 const gameExitBtn = document.getElementById('game-exit');
 
-// Heuristic distance from the current block to a block in destChannel, using
-// only locally-loaded data (no extra API calls). Counts how far through the
-// current H/V channels you'd have to scroll to hit a destination block, and
-// falls back to checking just the visible cube neighbors. Returns null when
-// nothing reachable is in view — we render that as "many".
+// Distance from the current block to a block in destChannel.
+//
+// Primary signal is the *constructed solution path*: at game start the user
+// is on `path[0]`, so distance = `path.length - 1` (= the configured hop
+// count). Each correct flip lands them on the next path block, dropping
+// distance by one. Using the path keeps the stat at exactly N at game start
+// instead of dipping below (when the scan finds a closer destBlock in the
+// visible axes) or jumping to "many" (when the scan can't see one).
+//
+// When the user steps off the path we fall back to a local scan: visible
+// cube neighbors first, then further along the loaded H/V channels. Returns
+// null when nothing reachable is in view — we render that as "many".
 function computeFlipsAway() {
   if (!gameState.active) return null;
   const cur = cubeState.current;
@@ -510,6 +575,12 @@ function computeFlipsAway() {
   const dest = gameState.destBlockIds;
   if (!dest || !dest.size) return null;
   if (dest.has(cur.id)) return 0;
+
+  const path = gameState.path;
+  if (path && path.length) {
+    const i = path.indexOf(cur.id);
+    if (i !== -1) return path.length - 1 - i;
+  }
 
   let best = Infinity;
   for (const f of ['top', 'bottom', 'left', 'right']) {
@@ -594,13 +665,15 @@ async function startGame() {
   gameLoading.hidden = false;
   document.getElementById('meta-title').textContent = 'setting up the game…';
   try {
-    const { startBlock, destChannel, destBlockIds } = await buildGameScenario();
+    const { startBlock, destChannel, destBlockIds, walkedPath } = await buildGameScenario();
     gameState.active = true;
     gameState.destChannel = destChannel;
     gameState.destBlockIds = destBlockIds;
+    gameState.path = walkedPath || [];
     gameState.steps = 0;
     gameState.won = false;
     gameState.visitedBlocks = new Set();
+    gameBlockCache.clear();
     hideGameResult();
     renderGamePanel();
     // Re-enable only the exit button; entry stays disabled while playing.
@@ -620,9 +693,11 @@ function exitGame() {
   gameState.active = false;
   gameState.destChannel = null;
   gameState.destBlockIds = new Set();
+  gameState.path = [];
   gameState.steps = 0;
   gameState.won = false;
   gameState.visitedBlocks = new Set();
+  gameBlockCache.clear();
   renderGamePanel();
   hideGameResult();
   setEntryDisabled(false);

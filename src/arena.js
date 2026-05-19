@@ -145,29 +145,82 @@ export async function pickRandomBlock() {
 //
 // Returns `{startBlock, destChannel, destBlockIds}` (a Set of image-block IDs
 // in the destination channel) or null if a walk can't be completed.
+// Block stubs returned inside a channel's `contents` array usually carry
+// their own `connections` list — when they do we can use them directly and
+// skip a per-block GET. Falls back to a full `/blocks/:id` fetch only when
+// the stub came back stripped (some are.na responses do).
+async function blockWithConnections(stub) {
+  if (stub && stub.connections && stub.connections.length) return stub;
+  return await fetchBlock(stub.id);
+}
+
 export async function pickGameSetup(hops = 3) {
-  // Pick a starting block with channel connections.
+  // Pick a starting block with channel connections. To minimise requests we
+  // reuse each random channel's listing for several stub attempts — paying
+  // for a fresh search + channel fetch only after exhausting a few blocks.
   let startBlock = null;
-  for (let i = 0; i < 8 && !startBlock; i++) {
-    try {
-      const pick = await pickRandomChannelWithImageBlocks();
-      if (!pick) continue;
-      const stub = pick.blocks[Math.floor(Math.random() * pick.blocks.length)];
-      const full = await fetchBlock(stub.id);
-      if (getConnections(full).length) startBlock = full;
-    } catch (e) { /* retry */ }
+  outer: for (let i = 0; i < 4 && !startBlock; i++) {
+    let pick = null;
+    try { pick = await pickRandomChannelWithImageBlocks(); } catch (e) {}
+    if (!pick) continue;
+    const stubs = pick.blocks.slice(0, Math.min(4, pick.blocks.length));
+    for (const stub of stubs) {
+      try {
+        const full = await blockWithConnections(stub);
+        if (getConnections(full).length) { startBlock = full; break outer; }
+      } catch (e) { /* try next stub from the same page */ }
+    }
   }
   if (!startBlock) return null;
 
+  // At each hop we have at most two solver-friendly strategies, both aligned
+  // with what the game's axis-picker will surface to the user:
+  //   - "continue": stay on the previous channel in the same direction —
+  //     equivalent to one more flip on the same cube axis.
+  //   - "switch": jump to the top safe channel *excluding* the previous one
+  //     with a random direction — equivalent to flipping the perpendicular
+  //     axis, which the game freshly picks as the top non-kept channel.
+  // Strategy order is randomized per hop so we get a mix of same-axis runs
+  // and axis switches, instead of always sliding in one direction.
   const visited = new Set([startBlock.id]);
+  // `walkedPath` is the constructed 1-flip-per-step solution. Returned to the
+  // caller so the game can report a deterministic "N flips away" stat: at the
+  // start the user is on path[0] so distance = hops; each correct flip drops
+  // it by one. Without this the runtime scan can report <hops (shortcut found
+  // in visible channels) or "many" (destination simply not in view).
+  const walkedPath = [startBlock.id];
   let current = startBlock;
+  let keptChannel = null;
+  let keptDirection = null; // +1 or -1; defined once keptChannel is set
   for (let hop = 0; hop < hops; hop++) {
-    const conns = shuffled(getConnections(current).filter(channelLooksSafe));
+    const allConns = getConnections(current).filter(channelLooksSafe);
+    const switchChannel = allConns.find(c => c.slug !== keptChannel?.slug) || null;
+    const continueChannel = keptChannel && allConns.some(c => c.slug === keptChannel.slug)
+      ? keptChannel : null;
+
+    // Prefer "switch" so the path alternates cube axes (and thus visual
+    // directions) instead of marching in a single one. "continue" reuses
+    // keptDirection by construction, so a chain of continues looks like a
+    // single slide in one direction. We only fall through to it when the
+    // switch channel can't produce an unvisited neighbor.
+    const strategies = [];
+    if (switchChannel) {
+      strategies.push({
+        channel: switchChannel,
+        dirs: Math.random() < 0.5 ? [1, -1] : [-1, 1],
+      });
+    }
+    if (continueChannel) {
+      strategies.push({ channel: continueChannel, dirs: [keptDirection] });
+    }
+
     let next = null;
-    for (const ch of conns) {
+    let chosenChannel = null;
+    let chosenDir = null;
+    for (const strat of strategies) {
       if (next) break;
       try {
-        const contents = await fetchChannelContents(ch.slug, 1, 100);
+        const contents = await fetchChannelContents(strat.channel.slug, 1, 100);
         if (contents['nsfw?']) continue;
         const list = (contents.contents || []).filter(b => b.class === 'Image' && b.image);
         if (list.length < 2) continue;
@@ -176,30 +229,43 @@ export async function pickGameSetup(hops = 3) {
         // lives past page 1 we can't determine a 1-flip neighbor, so skip.
         const idx = list.findIndex(b => b.id === current.id);
         if (idx === -1) continue;
-        // Try the immediate forward and backward neighbors (random order).
-        const dirs = Math.random() < 0.5 ? [1, -1] : [-1, 1];
-        for (const dir of dirs) {
+        for (const dir of strat.dirs) {
           const cand = list[(idx + dir + list.length) % list.length];
           if (!cand || visited.has(cand.id)) continue;
           try {
-            const full = await fetchBlock(cand.id);
+            const full = await blockWithConnections(cand);
             if (!getConnections(full).length) continue;
             next = full;
+            chosenChannel = strat.channel;
+            chosenDir = dir;
             break;
           } catch (e) { /* try the other direction */ }
         }
-      } catch (e) { /* try next channel */ }
+      } catch (e) { /* try next strategy */ }
     }
     if (!next) return null;
     visited.add(next.id);
+    walkedPath.push(next.id);
     current = next;
+    keptChannel = chosenChannel;
+    keptDirection = chosenDir;
   }
 
   // Use one of the final block's channels as the destination. The walked
   // path's final block is in that channel, so the path resolves the game —
   // but only if that block also appears on the channel's first page (which
   // is what destBlockIds covers), otherwise the win check never fires.
-  const destCandidates = shuffled(getConnections(current).filter(channelLooksSafe));
+  //
+  // `keptChannel` is the channel the final hop traveled through; we fetched
+  // it during the walk so it's still in cache. Try it first — if it works
+  // the destination costs zero extra requests.
+  const safeConns = getConnections(current).filter(channelLooksSafe);
+  const destCandidates = keptChannel
+    ? [
+        ...safeConns.filter(c => c.slug === keptChannel.slug),
+        ...safeConns.filter(c => c.slug !== keptChannel.slug),
+      ]
+    : safeConns;
   for (const ch of destCandidates) {
     try {
       const contents = await fetchChannelContents(ch.slug, 1, 100);
@@ -211,7 +277,7 @@ export async function pickGameSetup(hops = 3) {
       // Skip channels that already include the start block — that would be a
       // 0-flip win.
       if (destBlockIds.has(startBlock.id)) continue;
-      return { startBlock, destChannel: ch, destBlockIds };
+      return { startBlock, destChannel: ch, destBlockIds, walkedPath };
     } catch (e) { /* try another */ }
   }
   return null;
@@ -259,15 +325,24 @@ export function getConnections(block) {
 // check piggybacks on the contents fetch (the envelope carries `nsfw?`), so
 // we don't pay a separate meta GET per candidate. On an NSFW hit we discard
 // and try another candidate.
-export async function pickSafeChannelWithContents(connections, excludeSlugs = []) {
+//
+// Browse mode shuffles (cached-first for speed, random within each tier) so
+// every visit feels fresh. Game mode passes `deterministic: true` to walk
+// the block's natural connection order — `pickGameSetup` builds the solution
+// path against that same rule, so the constructed path is the one the user
+// actually sees on the cube.
+export async function pickSafeChannelWithContents(connections, excludeSlugs = [], { deterministic = false } = {}) {
   const exclude = new Set(excludeSlugs);
   const safe = connections.filter(c => channelLooksSafe(c) && !exclude.has(c.slug));
-  // Prefer already-prefetched channels (instant) over cold ones (network).
-  // Within each tier, pick randomly to preserve variety.
-  const cached = shuffled(safe.filter(c => hasCachedContents(c.slug)));
-  const cold = shuffled(safe.filter(c => !hasCachedContents(c.slug)));
-  const ordered = [...cached, ...cold];
-  console.log(`[arena] pickSafeChannel: ${safe.length} safe of ${connections.length} (${cached.length} cached, ${cold.length} cold) — trying ${ordered.map(c => c.slug).join(', ')}`);
+  let ordered;
+  if (deterministic) {
+    ordered = safe;
+  } else {
+    const cached = shuffled(safe.filter(c => hasCachedContents(c.slug)));
+    const cold = shuffled(safe.filter(c => !hasCachedContents(c.slug)));
+    ordered = [...cached, ...cold];
+  }
+  console.log(`[arena] pickSafeChannel: ${ordered.length} safe of ${connections.length} (${deterministic ? 'deterministic' : 'shuffled'}) — trying ${ordered.map(c => c.slug).join(', ')}`);
   const tStart = performance.now();
   for (const channel of ordered) {
     try {
