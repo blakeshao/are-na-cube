@@ -22,7 +22,53 @@
       <input id="entry-input" type="text" placeholder="paste an are.na block or channel URL" autocomplete="off" spellcheck="false" />
       <button id="entry-go" type="submit">go</button>
       <button id="entry-random" type="button">random</button>
+      <button id="entry-play" type="button">are.na rubik's cube</button>
     </form>
+
+    <div id="game-panel" hidden>
+      <div class="cube-anim-scene cube-anim-scene--panel">
+        <div class="cube-anim">
+          <div class="cube-anim-face cube-anim-face--front"></div>
+          <div class="cube-anim-face cube-anim-face--back"></div>
+          <div class="cube-anim-face cube-anim-face--right"></div>
+          <div class="cube-anim-face cube-anim-face--left"></div>
+          <div class="cube-anim-face cube-anim-face--top"></div>
+          <div class="cube-anim-face cube-anim-face--bottom"></div>
+        </div>
+      </div>
+      <div id="game-panel-body">
+        <div id="game-goal-label" class="dim">flip your way to</div>
+        <div id="game-goal-channel"></div>
+        <div id="game-distance" class="dim"></div>
+        <div id="game-status">
+          <span id="game-steps">0 flips</span>
+          <button id="game-debug-win" type="button">debug win</button>
+          <button id="game-exit" type="button">give up</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="game-result" hidden>
+      <div id="game-result-card">
+        <div id="game-result-title">you made it :)</div>
+        <div id="game-result-sub" class="dim">arrived in</div>
+        <div id="game-result-channel"></div>
+        <div id="game-result-stats">
+          <div class="stat">
+            <div class="stat-value" id="stat-flips">0</div>
+            <div class="stat-label">flips</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="stat-blocks">0</div>
+            <div class="stat-label">blocks seen</div>
+          </div>
+        </div>
+        <div id="game-result-actions">
+          <button id="game-result-again" type="button">play again</button>
+          <button id="game-result-close" type="button">close</button>
+        </div>
+      </div>
+    </div>
 
     <div id="meta-left">
       <div id="meta-title" class="dim">loading…</div>
@@ -68,6 +114,20 @@
     </div>
 
     <canvas id="stage"></canvas>
+
+    <div id="game-loading" hidden>
+      <div class="cube-anim-scene">
+        <div class="cube-anim">
+          <div class="cube-anim-face cube-anim-face--front"></div>
+          <div class="cube-anim-face cube-anim-face--back"></div>
+          <div class="cube-anim-face cube-anim-face--right"></div>
+          <div class="cube-anim-face cube-anim-face--left"></div>
+          <div class="cube-anim-face cube-anim-face--top"></div>
+          <div class="cube-anim-face cube-anim-face--bottom"></div>
+        </div>
+      </div>
+      <div id="game-loading-text">setting up the game…</div>
+    </div>
 
     <script type="module" src="/src/main.js"></script>
   </body>

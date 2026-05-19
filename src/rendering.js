@@ -27,8 +27,11 @@ function drawImageCovering(ctx, img) {
   ctx.fillStyle = '#0a0a0c';
   ctx.fillRect(0, 0, FACE_PX, FACE_PX);
   const inner = FACE_PX - FACE_PADDING * 2;
-  const ratio = Math.min(inner / img.width, inner / img.height);
-  const w = img.width * ratio, h = img.height * ratio;
+  // VideoFrame uses displayWidth/Height; HTMLImageElement uses width/height.
+  const iw = img.displayWidth || img.width;
+  const ih = img.displayHeight || img.height;
+  const ratio = Math.min(inner / iw, inner / ih);
+  const w = iw * ratio, h = ih * ratio;
   const x = (FACE_PX - w) / 2, y = (FACE_PX - h) / 2;
   ctx.drawImage(img, x, y, w, h);
 }
@@ -50,16 +53,124 @@ const imageCache = new Map();
 // (the common case after navigation, since neighbors prefetch eagerly).
 const imageReady = new Map();
 function loadImage(url) {
-  if (imageCache.has(url)) return imageCache.get(url);
+  if (imageCache.has(url)) {
+    const ready = imageReady.has(url);
+    console.log(`[img] cache ${ready ? 'hit (ready)' : 'hit (pending)'}: ${url.slice(0, 80)}`);
+    return imageCache.get(url);
+  }
+  console.log(`[img] fetching: ${url.slice(0, 80)}`);
+  const t0 = performance.now();
   const p = new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => { imageReady.set(url, img); resolve(img); };
-    img.onerror = () => reject(new Error('img load'));
+    img.onload = () => {
+      imageReady.set(url, img);
+      console.log(`[img] loaded in ${Math.round(performance.now() - t0)}ms: ${url.slice(0, 80)}`);
+      resolve(img);
+    };
+    img.onerror = () => {
+      console.log(`[img] failed after ${Math.round(performance.now() - t0)}ms: ${url.slice(0, 80)}`);
+      reject(new Error('img load'));
+    };
     img.src = url;
   });
   imageCache.set(url, p);
   return p;
+}
+
+function isAnimatedImage(block, url) {
+  const ct = block?.image?.content_type;
+  if (ct === 'image/gif' || ct === 'image/webp' || ct === 'image/apng') return true;
+  if (!url) return false;
+  const path = url.split('?')[0].toLowerCase();
+  return path.endsWith('.gif') || path.endsWith('.apng');
+}
+
+// Decode every frame of a GIF/animated image into VideoFrame objects with
+// per-frame durations. We use ImageDecoder because `ctx.drawImage` on a
+// detached <img> does NOT reliably sample successive GIF frames — most
+// browsers freeze the animation when the element isn't being rendered.
+const gifFramesCache = new Map();
+function loadAnimatedFrames(url) {
+  if (gifFramesCache.has(url)) return gifFramesCache.get(url);
+  if (typeof ImageDecoder === 'undefined') {
+    return Promise.reject(new Error('ImageDecoder unavailable'));
+  }
+  console.log(`[gif] decoding: ${url.slice(0, 80)}`);
+  const t0 = performance.now();
+  const p = (async () => {
+    const response = await fetch(url, { mode: 'cors' });
+    if (!response.ok) throw new Error(`fetch ${response.status}`);
+    const type = response.headers.get('content-type') || 'image/gif';
+    const decoder = new ImageDecoder({ data: response.body, type });
+    await decoder.completed;
+    const track = decoder.tracks.selectedTrack;
+    const count = track.frameCount;
+    const frames = [];
+    for (let i = 0; i < count; i++) {
+      const result = await decoder.decode({ frameIndex: i });
+      // VideoFrame.duration is in microseconds. GIFs with a 0 duration are
+      // sometimes encoded — fall back to a sane default so the loop advances.
+      const durationMs = result.image.duration ? result.image.duration / 1000 : 100;
+      frames.push({ image: result.image, duration: Math.max(20, durationMs) });
+    }
+    const totalDuration = frames.reduce((s, f) => s + f.duration, 0);
+    console.log(`[gif] decoded ${count} frames in ${Math.round(performance.now() - t0)}ms (total ${Math.round(totalDuration)}ms): ${url.slice(0, 80)}`);
+    return { frames, totalDuration };
+  })();
+  gifFramesCache.set(url, p);
+  p.catch(() => gifFramesCache.delete(url));
+  return p;
+}
+
+// Faces currently showing an animated image. The rAF loop advances each
+// face's frame index according to elapsed wall-clock time and the per-frame
+// durations baked into the decoded GIF.
+const animatedFaces = new Map();
+let animationRunning = false;
+function startAnimationLoop() {
+  if (animationRunning) return;
+  animationRunning = true;
+  const tick = (now) => {
+    if (animatedFaces.size === 0) { animationRunning = false; return; }
+    for (const [, entry] of animatedFaces) {
+      const t = ((now - entry.startTime) % entry.totalDuration);
+      let acc = 0;
+      let idx = entry.frames.length - 1;
+      for (let i = 0; i < entry.frames.length; i++) {
+        acc += entry.frames[i].duration;
+        if (t < acc) { idx = i; break; }
+      }
+      if (idx !== entry.lastIdx) {
+        drawImageCovering(entry.ft.ctx, entry.frames[idx].image);
+        entry.ft.texture.needsUpdate = true;
+        entry.lastIdx = idx;
+      }
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+function setAnimatedFace(faceName, ft, frames, totalDuration) {
+  animatedFaces.set(faceName, {
+    ft, frames, totalDuration,
+    startTime: performance.now(),
+    lastIdx: -1,
+  });
+  startAnimationLoop();
+}
+function clearAnimatedFace(faceName) {
+  animatedFaces.delete(faceName);
+}
+
+async function startGifOnFace(faceName, ft, url, token) {
+  try {
+    const { frames, totalDuration } = await loadAnimatedFrames(url);
+    if (paintTokens[faceName] !== token) return;
+    setAnimatedFace(faceName, ft, frames, totalDuration);
+  } catch (e) {
+    console.log(`[gif] decode failed: ${e.message} — ${url.slice(0, 80)}`);
+  }
 }
 
 const paintTokens = {};
@@ -72,6 +183,7 @@ export async function paintFace(faceTextures, faceName, block) {
   // horizontal rotation).
   if (lastPaintedBlockId[faceName] === newId) return;
   lastPaintedBlockId[faceName] = newId;
+  clearAnimatedFace(faceName);
   const token = (paintTokens[faceName] = (paintTokens[faceName] || 0) + 1);
   if (!block) {
     drawPlaceholder(ft.ctx, '—');
@@ -79,12 +191,15 @@ export async function paintFace(faceTextures, faceName, block) {
     return;
   }
   const url = blockImageUrl(block);
+  const animated = isAnimatedImage(block, url);
   const ready = url ? imageReady.get(url) : null;
   if (ready) {
     drawImageCovering(ft.ctx, ready);
     ft.texture.needsUpdate = true;
+    if (animated) startGifOnFace(faceName, ft, url, token);
     return;
   }
+  console.log(`[paint] face=${faceName} block=${block.id} — showing placeholder, image not ready`);
   drawPlaceholder(ft.ctx, block.title || block.class || '');
   ft.texture.needsUpdate = true;
   if (!url) return;
@@ -93,6 +208,7 @@ export async function paintFace(faceTextures, faceName, block) {
     if (paintTokens[faceName] !== token) return;
     drawImageCovering(ft.ctx, img);
     ft.texture.needsUpdate = true;
+    if (animated) startGifOnFace(faceName, ft, url, token);
   } catch (e) {
     if (paintTokens[faceName] !== token) return;
     drawPlaceholder(ft.ctx, 'image unavailable');

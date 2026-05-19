@@ -6,6 +6,8 @@ import {
   fetchChannelContents,
   getConnections,
   pickSafeChannelWithContents,
+  pickRandomChannelWithImageBlocks,
+  pickGameSetup,
 } from './arena.js';
 import { paintFace } from './rendering.js';
 import { createScene, FACES, HALF_PI } from './cube3d.js';
@@ -58,11 +60,16 @@ function populateNeighbors() {
   for (const f of ['right', 'left', 'top', 'bottom', 'back']) {
     paint(f, cubeState.faces[f]);
   }
+  if (gameState.active) renderGamePanel();
 }
 
 async function seed(block) {
+  const tSeed = performance.now();
+  console.log(`[seed] start block=${block.id}`);
   cubeState.current = block;
   cubeState.loadingCurrent = false;
+  if (gameState.active && block?.id) gameState.visitedBlocks.add(block.id);
+  checkWin();
   cubeState.channelH = null;
   cubeState.channelV = null;
   cubeState.loadingH = true;
@@ -79,12 +86,14 @@ async function seed(block) {
 
   try {
     const connections = getConnections(block);
+    console.log(`[seed] ${connections.length} connections`);
     if (!connections.length) return;
-    const hPick = await pickSafeChannelWithContents(connections);
+    const opts = { deterministic: gameState.active };
+    const hPick = await pickSafeChannelWithContents(connections, [], opts);
     if (!hPick) return;
     cubeState.channelH = hPick.channel;
     cubeState.loadingH = false;
-    const vPick = await pickSafeChannelWithContents(connections, [hPick.channel.slug]) || hPick;
+    const vPick = await pickSafeChannelWithContents(connections, [hPick.channel.slug], opts) || hPick;
     cubeState.channelV = vPick.channel;
     cubeState.loadingV = false;
 
@@ -95,6 +104,8 @@ async function seed(block) {
     cubeState.loadingH = false;
     cubeState.loadingV = false;
     updateMeta();
+    if (gameState.active) snapshotCurrentBlock();
+    console.log(`[seed] done in ${Math.round(performance.now() - tSeed)}ms — loadingCurrent=${cubeState.loadingCurrent} loadingH=${cubeState.loadingH} loadingV=${cubeState.loadingV}`);
   }
 }
 
@@ -117,12 +128,82 @@ function applyPermutation(key) {
   for (const f of FACES) paint(f, next[f]);
 }
 
+// ---------- game mode ----------
+const gameState = {
+  active: false,
+  destChannel: null,
+  destBlockIds: new Set(),
+  // The constructed solution path (array of block IDs from start → destination).
+  // When the user is sitting on one of these blocks, distance is exact:
+  // `path.length - 1 - index`. Off-path positions fall back to the scan
+  // heuristic, which is best-effort.
+  path: [],
+  steps: 0,
+  won: false,
+  visitedBlocks: new Set(),
+};
+
+// Game-mode only: cache each visited block's full cube state (channels,
+// listings, indexes). When the user flips back to a block they've been on
+// before we restore from cache instead of re-fetching the block and
+// re-rolling its perpendicular axis — that re-roll is what previously made
+// "going back" land you somewhere unfamiliar.
+const gameBlockCache = new Map();
+
+function snapshotCurrentBlock() {
+  const id = cubeState.current?.id;
+  if (!gameState.active || !id) return;
+  gameBlockCache.set(id, {
+    block: cubeState.current,
+    channelH: cubeState.channelH,
+    channelV: cubeState.channelV,
+    blocksH: cubeState.blocksH,
+    blocksV: cubeState.blocksV,
+    idxH: cubeState.idxH,
+    idxV: cubeState.idxV,
+  });
+}
+
+function restoreBlockSnapshot(id) {
+  const s = gameBlockCache.get(id);
+  if (!s) return false;
+  cubeState.current = s.block;
+  cubeState.channelH = s.channelH;
+  cubeState.channelV = s.channelV;
+  cubeState.blocksH = s.blocksH;
+  cubeState.blocksV = s.blocksV;
+  cubeState.idxH = s.idxH;
+  cubeState.idxV = s.idxV;
+  cubeState.loadingCurrent = false;
+  cubeState.loadingH = false;
+  cubeState.loadingV = false;
+  return true;
+}
+
+function checkWin() {
+  if (!gameState.active || gameState.won) return;
+  const id = cubeState.current?.id;
+  if (id && gameState.destBlockIds.has(id)) {
+    gameState.won = true;
+    renderGamePanel();
+    showGameResult();
+  }
+}
+
 let promoting = false;
 let wheelLocked = false;
 async function onLanded(rx, ry) {
   if (promoting) return;
   if (rx === 0 && ry === 0) return;
+  const tLand = performance.now();
+  console.log(`[onLanded] start rx=${rx} ry=${ry}`);
+  if (gameState.active && !gameState.won) {
+    gameState.steps += Math.abs(rx) + Math.abs(ry);
+    renderGamePanel();
+  }
   promoting = true;
+  // Snapshot the block we're about to leave so a return flip can restore it.
+  if (gameState.active) snapshotCurrentBlock();
   try {
     if (ry !== 0) {
       const key = ry < 0 ? 'y-1' : 'y+1';
@@ -148,6 +229,18 @@ async function onLanded(rx, ry) {
     const newCurrent = cubeState.faces.front;
     if (!newCurrent || (cubeState.current && newCurrent.id === cubeState.current.id)) return;
 
+    // Game mode: if we've been on this block before, restore its full cached
+    // state — no refetch, no perpendicular re-pick. The user sees the same
+    // channels/neighbors they saw last time they were here.
+    if (gameState.active && gameBlockCache.has(newCurrent.id)) {
+      restoreBlockSnapshot(newCurrent.id);
+      populateNeighbors();
+      updateMeta();
+      checkWin();
+      console.log(`[onLanded] restored cached state for block ${newCurrent.id}`);
+      return;
+    }
+
     // Keep the channel along the axis we just traveled through; only re-pick
     // the perpendicular one. The new block lives in the traveled channel
     // (it came from blocksH/blocksV), but it has no relationship to the old
@@ -170,13 +263,21 @@ async function onLanded(rx, ry) {
       // Refetch the full block so we have its channel list.
       let full = newCurrent;
       if (!full.connections || full.connections.length === 0) {
+        console.log(`[onLanded] stub has no connections, refetching block ${newCurrent.id}`);
+        const tFb = performance.now();
         try { full = await fetchBlock(newCurrent.id); }
-        catch (e) { /* keep stub */ }
+        catch (e) { console.log(`[onLanded] fetchBlock failed: ${e.message}`); }
+        console.log(`[onLanded] block refetch took ${Math.round(performance.now() - tFb)}ms`);
+      } else {
+        console.log(`[onLanded] stub already has ${full.connections.length} connections, no refetch needed`);
       }
       cubeState.current = full;
       cubeState.loadingCurrent = false;
+      if (gameState.active && full?.id) gameState.visitedBlocks.add(full.id);
       updateMeta();
+      checkWin();
       const connections = getConnections(full);
+      console.log(`[onLanded] ${connections.length} safe connections — keepH=${keepH} keepV=${keepV}`);
       if (!connections.length) return;
 
       if (keepH && keepV) {
@@ -186,7 +287,7 @@ async function onLanded(rx, ry) {
 
       const keptSlug = keepH ? cubeState.channelH?.slug : cubeState.channelV?.slug;
       const pool = connections.filter(c => c.slug !== keptSlug);
-      const pick = await pickSafeChannelWithContents(pool.length ? pool : connections);
+      const pick = await pickSafeChannelWithContents(pool.length ? pool : connections, [], { deterministic: gameState.active });
       if (!pick) {
         populateNeighbors();
         return;
@@ -212,6 +313,7 @@ async function onLanded(rx, ry) {
   } finally {
     promoting = false;
     wheelLocked = false;
+    console.log(`[onLanded] done in ${Math.round(performance.now() - tLand)}ms — current=${cubeState.current?.id} loadingCurrent=${cubeState.loadingCurrent} loadingH=${cubeState.loadingH} loadingV=${cubeState.loadingV}`);
   }
 }
 
@@ -230,20 +332,25 @@ function loadingBlurSpan(len) {
 }
 
 const FADE_MS = 180;
-const fadeTimers = new WeakMap();
+// Track the pending target per element so rapid-fire fadeSet calls compare
+// against what's *about to be written*, not what's currently in the DOM.
+// Without this, if call A schedules "write blur" and call B wants the same
+// value the DOM already shows, B no-ops without cancelling A — and A's blur
+// lands ~180ms later with no further updateMeta to clear it.
+const fadePending = new WeakMap();
 function fadeSet(el, newValue, asHtml = false) {
-  const current = asHtml ? el.innerHTML : el.textContent;
+  const pending = fadePending.get(el);
+  const current = pending ? pending.value : (asHtml ? el.innerHTML : el.textContent);
   if (current === newValue) return;
-  const prev = fadeTimers.get(el);
-  if (prev) clearTimeout(prev);
+  if (pending) clearTimeout(pending.timer);
   el.style.opacity = '0';
-  const t = setTimeout(() => {
+  const timer = setTimeout(() => {
     if (asHtml) el.innerHTML = newValue;
     else el.textContent = newValue;
     el.style.opacity = '1';
-    fadeTimers.delete(el);
+    fadePending.delete(el);
   }, FADE_MS);
-  fadeTimers.set(el, t);
+  fadePending.set(el, { timer, value: newValue });
 }
 
 function formatDate(s) {
@@ -254,6 +361,7 @@ function formatDate(s) {
 }
 
 function updateMeta() {
+  console.log(`[updateMeta] current=${cubeState.current?.id ?? 'null'} loadingCurrent=${cubeState.loadingCurrent} channelH=${cubeState.channelH?.slug ?? 'null'}/loadingH=${cubeState.loadingH} channelV=${cubeState.channelV?.slug ?? 'null'}/loadingV=${cubeState.loadingV}`);
   const t = document.getElementById('meta-title');
   const author = document.getElementById('meta-author');
   const created = document.getElementById('meta-created');
@@ -426,12 +534,190 @@ async function startRandom() {
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
+  if (gameState.active) return;
   const id = parseBlockInput(input.value);
   if (id) { startWithBlockId(id); return; }
   const slug = parseChannelInput(input.value);
   if (slug) { startWithChannelSlug(slug); return; }
   document.getElementById('meta-title').textContent = 'paste an are.na block or channel URL';
 });
-randomBtn.addEventListener('click', startRandom);
+randomBtn.addEventListener('click', () => {
+  if (gameState.active) return;
+  startRandom();
+});
+
+// ---------- game mode UI ----------
+const playBtn = document.getElementById('entry-play');
+const goBtn = document.getElementById('entry-go');
+const gamePanel = document.getElementById('game-panel');
+const gameGoalChannel = document.getElementById('game-goal-channel');
+const gameStatus = document.getElementById('game-status');
+const gameStepsEl = document.getElementById('game-steps');
+const gameDistanceEl = document.getElementById('game-distance');
+const gameExitBtn = document.getElementById('game-exit');
+
+// Distance from the current block to a block in destChannel.
+//
+// Primary signal is the *constructed solution path*: at game start the user
+// is on `path[0]`, so distance = `path.length - 1` (= the configured hop
+// count). Each correct flip lands them on the next path block, dropping
+// distance by one. Using the path keeps the stat at exactly N at game start
+// instead of dipping below (when the scan finds a closer destBlock in the
+// visible axes) or jumping to "many" (when the scan can't see one).
+//
+// When the user steps off the path we fall back to a local scan: visible
+// cube neighbors first, then further along the loaded H/V channels. Returns
+// null when nothing reachable is in view — we render that as "many".
+function computeFlipsAway() {
+  if (!gameState.active) return null;
+  const cur = cubeState.current;
+  if (!cur) return null;
+  const dest = gameState.destBlockIds;
+  if (!dest || !dest.size) return null;
+  if (dest.has(cur.id)) return 0;
+
+  const path = gameState.path;
+  if (path && path.length) {
+    const i = path.indexOf(cur.id);
+    if (i !== -1) return path.length - 1 - i;
+  }
+
+  let best = Infinity;
+  for (const f of ['top', 'bottom', 'left', 'right']) {
+    const n = cubeState.faces[f];
+    if (n && dest.has(n.id)) best = Math.min(best, 1);
+  }
+  const scanChannel = (blocks, idx) => {
+    const n = blocks.length;
+    if (n < 2) return;
+    const max = Math.floor(n / 2);
+    for (let k = 1; k <= max && k < best; k++) {
+      if (dest.has(blocks[(idx + k) % n].id) || dest.has(blocks[((idx - k) % n + n) % n].id)) {
+        best = k;
+        return;
+      }
+    }
+  };
+  scanChannel(cubeState.blocksH, cubeState.idxH);
+  scanChannel(cubeState.blocksV, cubeState.idxV);
+  return Number.isFinite(best) ? best : null;
+}
+
+function renderGamePanel() {
+  if (!gameState.active) {
+    gamePanel.hidden = true;
+    return;
+  }
+  gamePanel.hidden = false;
+  gameGoalChannel.textContent = gameState.destChannel?.title || '—';
+  gameStepsEl.textContent = `${gameState.steps} ${gameState.steps === 1 ? 'flip' : 'flips'}`;
+  gameExitBtn.textContent = gameState.won ? 'done' : 'give up';
+  const d = computeFlipsAway();
+  if (d == null) {
+    gameDistanceEl.innerHTML = `<span class="game-distance-num">many</span> flips away`;
+  } else {
+    gameDistanceEl.innerHTML = `<span class="game-distance-num">${d}</span> ${d === 1 ? 'flip' : 'flips'} away`;
+  }
+}
+
+const gameResult = document.getElementById('game-result');
+const gameResultChannel = document.getElementById('game-result-channel');
+const statFlips = document.getElementById('stat-flips');
+const statBlocks = document.getElementById('stat-blocks');
+const gameResultAgain = document.getElementById('game-result-again');
+const gameResultClose = document.getElementById('game-result-close');
+
+function showGameResult() {
+  gameResultChannel.textContent = gameState.destChannel?.title || '—';
+  statFlips.textContent = String(gameState.steps);
+  statBlocks.textContent = String(gameState.visitedBlocks.size);
+  gameResult.hidden = false;
+}
+
+function hideGameResult() {
+  gameResult.hidden = true;
+}
+
+function setEntryDisabled(disabled) {
+  input.disabled = disabled;
+  goBtn.disabled = disabled;
+  randomBtn.disabled = disabled;
+  playBtn.disabled = disabled;
+}
+
+const TARGET_HOPS = 5;
+async function buildGameScenario() {
+  // Walk TARGET_HOPS channel-hops away from a random starting block to derive
+  // a destination channel that is reachable from the start in that many flips.
+  for (let i = 0; i < 5; i++) {
+    try {
+      const setup = await pickGameSetup(TARGET_HOPS);
+      if (setup) return setup;
+    } catch (e) { /* retry */ }
+  }
+  throw new Error('could not build a game');
+}
+
+const gameLoading = document.getElementById('game-loading');
+async function startGame() {
+  if (gameState.active) return;
+  setEntryDisabled(true);
+  gameLoading.hidden = false;
+  document.getElementById('meta-title').textContent = 'setting up the game…';
+  try {
+    const { startBlock, destChannel, destBlockIds, walkedPath } = await buildGameScenario();
+    gameState.active = true;
+    gameState.destChannel = destChannel;
+    gameState.destBlockIds = destBlockIds;
+    gameState.path = walkedPath || [];
+    gameState.steps = 0;
+    gameState.won = false;
+    gameState.visitedBlocks = new Set();
+    gameBlockCache.clear();
+    hideGameResult();
+    renderGamePanel();
+    // Re-enable only the exit button; entry stays disabled while playing.
+    playBtn.disabled = true;
+    await seed(startBlock);
+  } catch (e) {
+    document.getElementById('meta-title').textContent = `game setup failed: ${e.message}`;
+    setEntryDisabled(false);
+    gameState.active = false;
+    renderGamePanel();
+  } finally {
+    gameLoading.hidden = true;
+  }
+}
+
+function exitGame() {
+  gameState.active = false;
+  gameState.destChannel = null;
+  gameState.destBlockIds = new Set();
+  gameState.path = [];
+  gameState.steps = 0;
+  gameState.won = false;
+  gameState.visitedBlocks = new Set();
+  gameBlockCache.clear();
+  renderGamePanel();
+  hideGameResult();
+  setEntryDisabled(false);
+}
+
+playBtn.addEventListener('click', startGame);
+gameExitBtn.addEventListener('click', exitGame);
+
+const gameDebugWinBtn = document.getElementById('game-debug-win');
+gameDebugWinBtn.addEventListener('click', () => {
+  if (!gameState.active || gameState.won) return;
+  gameState.won = true;
+  renderGamePanel();
+  showGameResult();
+});
+gameResultClose.addEventListener('click', exitGame);
+gameResultAgain.addEventListener('click', () => {
+  hideGameResult();
+  exitGame();
+  startGame();
+});
 
 startRandom();
