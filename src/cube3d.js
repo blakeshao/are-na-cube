@@ -27,6 +27,41 @@ export const FACE_NORMALS = {
   bottom: [ 0, -1,  0],
 };
 
+const CAMERA_FOV = 35;
+const CAMERA_DISTANCE = 6;
+const CAMERA_HEIGHT = 0.4;
+// How much of the available width / height the cube's front face may take up.
+// Roomy landscape windows never reach either limit and keep the default
+// framing; on a phone the camera backs away until the cube fits instead of
+// being cropped.
+const MAX_WIDTH_FILL = 0.8;
+const MAX_BAND_FILL = 0.92;
+
+// Frame the cube for a `width` x `height` viewport. `insets` (px) marks strips
+// at the top and bottom that are covered by UI: when given, the cube is sized
+// to the band between them and centered there rather than on the viewport.
+function fitCamera(camera, width, height, insets) {
+  let limit = width * MAX_WIDTH_FILL;
+  let shift = 0;
+  if (insets) {
+    const band = Math.max(1, height - insets.top - insets.bottom);
+    limit = Math.min(limit, band * MAX_BAND_FILL);
+    shift = height / 2 - (insets.top + band / 2);
+  }
+  // Distance at which the front face spans `limit` pixels.
+  const halfFov = THREE.MathUtils.degToRad(CAMERA_FOV / 2);
+  const fit = HALF + (CUBE_SIZE * height) / (2 * Math.tan(halfFov) * limit);
+  const distance = Math.max(CAMERA_DISTANCE, fit);
+  camera.aspect = width / height;
+  camera.position.set(0, CAMERA_HEIGHT * distance / CAMERA_DISTANCE, distance);
+  camera.lookAt(0, 0, 0);
+  // A view offset slides the picture without re-aiming the camera, so the
+  // cube keeps its head-on look wherever it sits on screen.
+  if (shift) camera.setViewOffset(width, height, 0, shift, width, height);
+  else camera.clearViewOffset();
+  camera.updateProjectionMatrix();
+}
+
 function makeFogRoughnessMap(size) {
   const c = document.createElement('canvas');
   c.width = c.height = size;
@@ -58,7 +93,9 @@ function makeFogRoughnessMap(size) {
 
 export function createScene(canvas) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-  renderer.setPixelRatio(window.devicePixelRatio);
+  // The glass material renders the scene twice; 3x phone screens don't need
+  // (and can't comfortably afford) more than 2x.
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
@@ -69,9 +106,7 @@ export function createScene(canvas) {
   const pmrem = new THREE.PMREMGenerator(renderer);
   scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
-  const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 100);
-  camera.position.set(0, 0.4, 6);
-  camera.lookAt(0, 0, 0);
+  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 100);
 
   const key = new THREE.DirectionalLight(0xffffff, 1.4);
   key.position.set(3, 5, 4);
@@ -150,12 +185,11 @@ export function createScene(canvas) {
     cube.add(mesh);
   }
 
-  window.addEventListener('resize', () => {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
+  const resize = (insets) => {
+    fitCamera(camera, window.innerWidth, window.innerHeight, insets);
     renderer.setSize(window.innerWidth, window.innerHeight);
-  });
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  };
+  resize();
 
-  return { renderer, scene, camera, cube, faceTextures };
+  return { renderer, scene, camera, cube, faceTextures, resize };
 }
