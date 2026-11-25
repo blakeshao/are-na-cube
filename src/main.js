@@ -738,8 +738,8 @@ function computeFlipsAway() {
   return Number.isFinite(best) ? best : null;
 }
 
-// Write a scoreboard number, giving it a brief pulse when it actually changes
-// so the eye catches the score moving.
+// Write a scoreboard number. When it actually changes, the digits just swap
+// and the color flickers with hard cuts — no scale, no fade.
 function setStat(el, text) {
   if (el.textContent === text) return;
   el.textContent = text;
