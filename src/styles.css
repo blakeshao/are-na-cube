@@ -58,7 +58,7 @@ button { touch-action: manipulation; }
   align-items: center;
   gap: 8px;
   color: var(--ink);
-  font-weight: 600;
+  font-weight: 400;
   letter-spacing: 0.02em;
 }
 .logo-cube {
@@ -252,7 +252,7 @@ button { touch-action: manipulation; }
 }
 #game-goal-channel {
   font-size: 24px;
-  font-weight: 400;
+  font-weight: 500;
   line-height: 1.2;
   color: var(--ink);
   word-break: break-word;
