@@ -40,7 +40,7 @@ function drawPlaceholder(ctx, label) {
   ctx.fillStyle = '#15151a';
   ctx.fillRect(0, 0, FACE_PX, FACE_PX);
   ctx.fillStyle = '#3a3a42';
-  ctx.font = '40px ui-sans-serif, system-ui, sans-serif';
+  ctx.font = '40px "ABC Areal", Arial, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   const text = (label || '…').slice(0, 40);
